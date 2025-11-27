@@ -134,7 +134,7 @@ func prepareSeedData(identityPath, messagePath string, cipher *messaging.AESGCMC
 	if err := messaging.EnsureSeedData(messagePath, cipher); err != nil {
 		log.Fatalf("seed message store: %v", err)
 	}
-}/home/yves/secure-messenger/certs/
+}
 
 func mustIdentityManager(identityPath string) *identity.Manager {
 	identityManager, err := identity.NewManager(identityPath)

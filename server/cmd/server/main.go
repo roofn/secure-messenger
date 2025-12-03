@@ -90,12 +90,12 @@ func envOrDefault(key, fallback string) string {
 }
 
 func parseConfig() serverConfig {
-	certPath := flag.String("cert", "/home/yves/secure-messenger/certs/server.pem", "Path to the server TLS certificate")
-	keyPath := flag.String("key", "/home/yves/secure-messenger/certs/server.key", "Path to the server TLS private key")
-	clientCAPath := flag.String("client-ca", "/home/yves/secure-messenger/certs/client_ca.pem", "Path to the client CA bundle")
-	listenAddr := flag.String("listen", ":8443", "Address the server should listen on")
-	storePath := flag.String("store", "data/messages.db", "Path to the message store file")
-	identityPath := flag.String("identity-store", "data/identity.db", "Path to the identity store file")
+	certPath := flag.String("cert", envOrDefault("SM_TLS_CERT", "/opt/secure-messenger/certs/server.pem"), "Path to the server TLS certificate")
+	keyPath := flag.String("key", envOrDefault("SM_TLS_KEY", "/opt/secure-messenger/certs/server.key"), "Path to the server TLS private key")
+	clientCAPath := flag.String("client-ca", envOrDefault("SM_TLS_CLIENT_CA", "/opt/secure-messenger/certs/client_ca.pem"), "Path to the client CA bundle")
+	listenAddr := flag.String("listen", envOrDefault("SM_LISTEN_ADDR", ":8443"), "Address the server should listen on")
+	storePath := flag.String("store", envOrDefault("SM_STORE", "data/messages.db"), "Path to the message store file")
+	identityPath := flag.String("identity-store", envOrDefault("SM_IDENTITY_STORE", "data/identity.db"), "Path to the identity store file")
 	httpListenAddr := flag.String("http-listen", ":8080", "Address the HTTP API should listen on")
 	messageKey := flag.String("message-key", envOrDefault("SM_MESSAGE_KEY", messaging.DefaultMessageKeyBase64), "Base64-encoded AES-256 key for encrypting HTTP messages")
 	logDir := flag.String("log-dir", "data/logs", "Directory where server logs should be stored")

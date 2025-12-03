@@ -1,4 +1,4 @@
-module github.com/utternonentity/secure-messenger/server
+module github.com/roofn/secure-messenger/server
 
 go 1.22
 

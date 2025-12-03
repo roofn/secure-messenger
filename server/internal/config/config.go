@@ -8,9 +8,9 @@ import (
 
 const (
 	defaultListenAddr   = ":8443"
-	defaultServerCert   = "/path/to/certs/server.pem"
-	defaultServerKey    = "/path/to/certs/server.key"
-	defaultClientCAFile = "/path/to/certs/client_ca.pem"
+	defaultServerCert   = "/opt/secure-messenger/certs/server.pem"
+	defaultServerKey    = "/opt/secure-messenger/certs/server.key"
+	defaultClientCAFile = "/opt/secure-messenger/certs/client_ca.pem"
 )
 
 // TLS holds file paths for server-side mutual TLS configuration.

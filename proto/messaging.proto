@@ -1,0 +1,25 @@
+syntax = "proto3";
+package sm.v1;
+option go_package = "github.com/roofn/secure-messenger/server/internal/gen/sm/v1;smv1";
+import "common.proto";
+
+
+service Messaging {
+rpc Send(EncryptedEnvelope) returns (SendResponse);
+rpc Pull(PullRequest) returns (stream EncryptedEnvelope);
+}
+
+
+message EncryptedEnvelope {
+EnvelopeMeta meta = 1;
+bytes ciphertext = 2; 
+}
+
+
+message SendResponse { string server_msg_id = 1; }
+
+
+message PullRequest {
+  string since_server_msg_id = 1;
+  repeated string conversation_ids = 2;
+}

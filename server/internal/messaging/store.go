@@ -1,0 +1,373 @@
+package messaging
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/gob"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"google.golang.org/protobuf/proto"
+
+	smv1 "github.com/roofn/secure-messenger/server/internal/gen/sm/v1"
+)
+
+// StoredEnvelope represents a persisted envelope along with its monotonic identifier.
+type StoredEnvelope struct {
+	ID       int64
+	Envelope *smv1.EncryptedEnvelope
+}
+
+type envelopeRepository interface {
+	Save(ctx context.Context, env *smv1.EncryptedEnvelope) (int64, error)
+	ForEachSince(ctx context.Context, afterID int64, fn func(StoredEnvelope) error) error
+}
+
+type readMarkerRepository interface {
+	UpdateReadMarker(ctx context.Context, conversationID, userID string, lastMsgID int64) error
+	ReadMarkers(ctx context.Context) (map[string]map[string]int64, error)
+}
+
+type fileStore struct {
+	mu             sync.RWMutex
+	path           string
+	cipher         EnvelopeCipher
+	records        []fileRecord
+	nextID         int64
+	keyFingerprint string
+	readMarkers    map[string]map[string]int64
+}
+
+type fileRecord struct {
+	id       int64
+	envelope *smv1.EncryptedEnvelope
+}
+
+type storeSnapshot struct {
+	Messages       []storedMessage             `json:"messages"`
+	KeyFingerprint string                      `json:"key_fingerprint,omitempty"`
+	ReadMarkers    map[string]map[string]int64 `json:"read_markers,omitempty"`
+}
+
+type storedMessage struct {
+	ID             int64  `json:"id"`
+	ConversationID string `json:"conversation_id"`
+	SenderUserID   string `json:"sender_user_id"`
+	SentUnixSec    int64  `json:"sent_unix_sec"`
+	Ciphertext     []byte `json:"ciphertext,omitempty"`
+	CiphertextB64  string `json:"ciphertext_b64,omitempty"`
+	Plaintext      string `json:"text,omitempty"`
+	ServerMsgID    string `json:"server_msg_id,omitempty"`
+}
+
+// NewStore creates a persistent store backed by a JSON file.
+func NewStore(path string, cipher EnvelopeCipher) (*fileStore, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("store path must not be empty")
+	}
+	if cipher == nil {
+		return nil, fmt.Errorf("store cipher must not be nil")
+	}
+	store := &fileStore{path: path, cipher: cipher}
+	dirty, err := store.load()
+	if err != nil {
+		return nil, err
+	}
+	if store.keyFingerprint != "" && store.keyFingerprint != cipher.Fingerprint() {
+		return nil, fmt.Errorf("message store encrypted with a different key; update SM_MESSAGE_KEY")
+	}
+	if store.keyFingerprint == "" {
+		store.keyFingerprint = cipher.Fingerprint()
+		dirty = true
+	}
+	if dirty {
+		if err := store.persist(); err != nil {
+			return nil, err
+		}
+	}
+	return store, nil
+}
+
+// Close is kept for compatibility with previous implementations.
+func (s *fileStore) Close() error { return nil }
+
+func (s *fileStore) load() (bool, error) {
+	dirty := false
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.records = nil
+		s.nextID = 0
+		s.readMarkers = make(map[string]map[string]int64)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read message store: %w", err)
+	}
+	snapshot, err := decodeSnapshot(data)
+	if err != nil {
+		return false, fmt.Errorf("unmarshal message store: %w", err)
+	}
+	s.keyFingerprint = strings.TrimSpace(snapshot.KeyFingerprint)
+	s.readMarkers = make(map[string]map[string]int64)
+	records := make([]fileRecord, 0, len(snapshot.Messages))
+	var maxID int64
+	for _, msg := range snapshot.Messages {
+		env := &smv1.EncryptedEnvelope{Meta: &smv1.EnvelopeMeta{}}
+		if msg.ConversationID != "" {
+			env.Meta.ConversationId = msg.ConversationID
+		}
+		if msg.SenderUserID != "" {
+			env.Meta.SenderUserId = msg.SenderUserID
+		}
+		if msg.SentUnixSec != 0 {
+			env.Meta.SentUnixSec = msg.SentUnixSec
+		}
+
+		id := msg.ID
+		if id == 0 && msg.ServerMsgID != "" {
+			parsed, err := parseServerMsgID(msg.ServerMsgID)
+			if err == nil {
+				id = parsed
+			}
+		}
+		if id == 0 {
+			id = maxID + 1
+			dirty = true
+		}
+
+		ciphertext := append([]byte(nil), msg.Ciphertext...)
+		if len(ciphertext) == 0 && msg.CiphertextB64 != "" {
+			payload, err := base64.StdEncoding.DecodeString(msg.CiphertextB64)
+			if err != nil {
+				return false, fmt.Errorf("decode message %d ciphertext: %w", msg.ID, err)
+			}
+			ciphertext = payload
+		}
+
+		if len(ciphertext) == 0 && strings.TrimSpace(msg.Plaintext) != "" {
+			if s.cipher == nil {
+				return false, fmt.Errorf("store cipher is required to encrypt plaintext messages")
+			}
+			encrypted, err := s.cipher.Encrypt([]byte(msg.Plaintext))
+			if err != nil {
+				return false, fmt.Errorf("encrypt legacy message %d: %w", id, err)
+			}
+			ciphertext = encrypted
+			dirty = true
+		}
+
+		env.Ciphertext = ciphertext
+
+		records = append(records, fileRecord{id: id, envelope: env})
+		if id > maxID {
+			maxID = id
+		}
+	}
+	s.records = records
+	s.nextID = maxID
+	for convID, markers := range snapshot.ReadMarkers {
+		convID = strings.TrimSpace(convID)
+		if convID == "" {
+			continue
+		}
+		for userID, marker := range markers {
+			userID = strings.TrimSpace(userID)
+			if userID == "" || marker <= 0 {
+				continue
+			}
+			if _, ok := s.readMarkers[convID]; !ok {
+				s.readMarkers[convID] = make(map[string]int64)
+			}
+			s.readMarkers[convID][userID] = marker
+		}
+	}
+	return dirty, nil
+}
+
+func decodeSnapshot(data []byte) (storeSnapshot, error) {
+	var snapshot storeSnapshot
+	if len(data) == 0 {
+		return snapshot, nil
+	}
+	var gobErr error
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&snapshot); err == nil {
+		return snapshot, nil
+	} else {
+		gobErr = err
+	}
+	var legacy storeSnapshot
+	if err := json.Unmarshal(data, &legacy); err == nil {
+		return legacy, nil
+	}
+	return snapshot, fmt.Errorf("decode snapshot: unsupported format (%v)", gobErr)
+}
+
+func (s *fileStore) persist() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.persistLocked()
+}
+
+func (s *fileStore) persistLocked() error {
+	wrapper := storeSnapshot{Messages: make([]storedMessage, 0, len(s.records))}
+	for _, rec := range s.records {
+		env := rec.envelope
+		meta := env.GetMeta()
+		msg := storedMessage{ID: rec.id}
+		if meta != nil {
+			msg.ConversationID = meta.GetConversationId()
+			msg.SenderUserID = meta.GetSenderUserId()
+			msg.SentUnixSec = meta.GetSentUnixSec()
+		}
+		if len(env.GetCiphertext()) > 0 {
+			msg.Ciphertext = append([]byte(nil), env.GetCiphertext()...)
+		}
+		wrapper.Messages = append(wrapper.Messages, msg)
+	}
+	if s.keyFingerprint != "" {
+		wrapper.KeyFingerprint = s.keyFingerprint
+	}
+	if len(s.readMarkers) > 0 {
+		wrapper.ReadMarkers = make(map[string]map[string]int64, len(s.readMarkers))
+		for convID, markers := range s.readMarkers {
+			cleanID := strings.TrimSpace(convID)
+			if cleanID == "" {
+				continue
+			}
+			convMarkers := make(map[string]int64, len(markers))
+			for userID, marker := range markers {
+				cleanUser := strings.TrimSpace(userID)
+				if cleanUser == "" || marker <= 0 {
+					continue
+				}
+				convMarkers[cleanUser] = marker
+			}
+			if len(convMarkers) > 0 {
+				wrapper.ReadMarkers[cleanID] = convMarkers
+			}
+		}
+	}
+
+	buf := &bytes.Buffer{}
+	if err := gob.NewEncoder(buf).Encode(&wrapper); err != nil {
+		return fmt.Errorf("marshal message store: %w", err)
+	}
+	dir := filepath.Dir(s.path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("prepare store directory: %w", err)
+		}
+	}
+	tmpPath := s.path + ".tmp"
+	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("write message store: %w", err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("commit message store: %w", err)
+	}
+	return nil
+}
+
+func (s *fileStore) Save(ctx context.Context, env *smv1.EncryptedEnvelope) (int64, error) {
+	if env == nil {
+		return 0, fmt.Errorf("envelope must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := s.nextID + 1
+	cloned := proto.Clone(env).(*smv1.EncryptedEnvelope)
+	s.records = append(s.records, fileRecord{id: id, envelope: cloned})
+	s.nextID = id
+	if err := s.persistLocked(); err != nil {
+		s.records = s.records[:len(s.records)-1]
+		s.nextID--
+		return 0, err
+	}
+	return id, nil
+}
+
+func (s *fileStore) ForEachSince(ctx context.Context, afterID int64, fn func(StoredEnvelope) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	snapshot := make([]fileRecord, 0, len(s.records))
+	for _, rec := range s.records {
+		if rec.id > afterID {
+			snapshot = append(snapshot, fileRecord{id: rec.id, envelope: proto.Clone(rec.envelope).(*smv1.EncryptedEnvelope)})
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, rec := range snapshot {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(StoredEnvelope{ID: rec.id, Envelope: rec.envelope}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *fileStore) UpdateReadMarker(ctx context.Context, conversationID, userID string, lastMsgID int64) error {
+	conversationID = strings.TrimSpace(conversationID)
+	userID = strings.TrimSpace(userID)
+	if conversationID == "" || userID == "" {
+		return fmt.Errorf("conversation_id and user_id are required")
+	}
+	if lastMsgID < 0 {
+		return fmt.Errorf("last message id must be non-negative")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.readMarkers == nil {
+		s.readMarkers = make(map[string]map[string]int64)
+	}
+	convMarkers, ok := s.readMarkers[conversationID]
+	if !ok {
+		convMarkers = make(map[string]int64)
+		s.readMarkers[conversationID] = convMarkers
+	}
+	if lastMsgID <= convMarkers[userID] {
+		return nil
+	}
+	convMarkers[userID] = lastMsgID
+	return s.persistLocked()
+}
+
+func (s *fileStore) ReadMarkers(ctx context.Context) (map[string]map[string]int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]map[string]int64, len(s.readMarkers))
+	for convID, markers := range s.readMarkers {
+		convCopy := make(map[string]int64, len(markers))
+		for userID, marker := range markers {
+			convCopy[userID] = marker
+		}
+		result[convID] = convCopy
+	}
+	return result, nil
+}

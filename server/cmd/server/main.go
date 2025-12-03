@@ -1,4 +1,4 @@
-ackage main
+package main
 
 import (
 	"context"
@@ -136,7 +136,82 @@ func mustMessageCipher(messageKey string) *messaging.AESGCMCipher {
 func prepareSeedData(identityPath, messagePath string, cipher *messaging.AESGCMCipher) {
 	if err := identity.EnsureSeedData(identityPath); err != nil {
 		log.Fatalf("seed identity store: %v", err)
-@@ -209,25 +215,42 @@ func mustDirectoryService(identityManager *identity.Manager) *directory.Service
+	}
+	if err := messaging.EnsureSeedData(messagePath, cipher); err != nil {
+		log.Fatalf("seed message store: %v", err)
+	}
+}
+
+func mustIdentityManager(identityPath string) *identity.Manager {
+	identityManager, err := identity.NewManager(identityPath)
+	if err != nil {
+		log.Fatalf("init identity store: %v", err)
+	}
+	return identityManager
+}
+
+func closeIdentityManager(manager *identity.Manager) {
+	if err := manager.Close(); err != nil {
+		log.Printf("close identity store: %v", err)
+	}
+}
+
+func mustLoadTLSConfig(cfg serverConfig, identityManager *identity.Manager) *tls.Config {
+	tlsCfg, err := mtls.LoadServerTLSConfig(cfg.certPath, cfg.keyPath, cfg.clientCAPath, func(cert *x509.Certificate) error {
+		_, err := identityManager.ValidateCertificate(cert)
+		return err
+	})
+	if err != nil {
+		log.Fatalf("TLS load: %v", err)
+	}
+	return tlsCfg
+}
+
+func listenOrExit(listenAddr string) net.Listener {
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	return lis
+}
+
+func mustMessageStore(messagePath string, cipher messaging.EnvelopeCipher) messageStore {
+	msgStore, err := messaging.NewStore(messagePath, cipher)
+	if err != nil {
+		log.Fatalf("init message store: %v", err)
+	}
+	return msgStore
+}
+
+func closeMessageStore(msgStore messageStore) {
+	if err := msgStore.Close(); err != nil {
+		log.Printf("close message store: %v", err)
+	}
+}
+
+func mustMessagingService(msgStore messageStore) *messaging.Service {
+	messagingService, err := messaging.NewService(msgStore)
+	if err != nil {
+		log.Fatalf("init messaging service: %v", err)
+	}
+	return messagingService
+}
+
+func mustAuthService(identityManager *identity.Manager) *auth.Service {
+	authService, err := auth.NewService(identityManager)
+	if err != nil {
+		log.Fatalf("init auth service: %v", err)
+	}
+	return authService
+}
+
+func mustDirectoryService(identityManager *identity.Manager) *directory.Service {
+	directoryService, err := directory.NewService(identityManager)
+	if err != nil {
+		log.Fatalf("init directory service: %v", err)
+	}
+	return directoryService
+}
 
 func mustHTTPMux(messagingService *messaging.Service, identityManager *identity.Manager, tokenManager *auth.TokenManager, cipher *messaging.AESGCMCipher) *http.ServeMux {
 	httpMessagesHandler, err := messaging.NewHTTPHandler(messagingService, tokenManager, cipher)

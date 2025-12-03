@@ -1,4 +1,4 @@
-package main
+ackage main
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"github.com/roofn/secure-messenger/server/internal/directory"
 	smv1 "github.com/roofn/secure-messenger/server/internal/gen/sm/v1"
 	"github.com/roofn/secure-messenger/server/internal/identity"
+	"github.com/roofn/secure-messenger/server/internal/logging"
 	"github.com/roofn/secure-messenger/server/internal/messaging"
 	"github.com/roofn/secure-messenger/server/internal/mtls"
 	"github.com/roofn/secure-messenger/server/internal/storage"
@@ -34,6 +35,7 @@ type serverConfig struct {
 	identityPath   string
 	httpListenAddr string
 	messageKey     string
+	logDir         string
 }
 
 type messageStore interface {
@@ -44,6 +46,8 @@ type messageStore interface {
 
 func main() {
 	cfg := parseConfig()
+	logFile := setupLogging(cfg.logDir)
+	defer closeLogFile(logFile)
 
 	identityStore := resolveDataPath(cfg.identityPath, "identity store")
 	messageStore := resolveDataPath(cfg.storePath, "message store")
@@ -86,14 +90,15 @@ func envOrDefault(key, fallback string) string {
 }
 
 func parseConfig() serverConfig {
-	certPath := flag.String("cert", "/path/to/certs/server.pem", "Path to the server TLS certificate")
-	keyPath := flag.String("key", "/path/to/certs/server.key", "Path to the server TLS private key")
-	clientCAPath := flag.String("client-ca", "/path/to/certs/client_ca.pem", "Path to the client CA bundle")
+	certPath := flag.String("cert", "/home/yves/secure-messenger/certs/server.pem", "Path to the server TLS certificate")
+	keyPath := flag.String("key", "/home/yves/secure-messenger/certs/server.key", "Path to the server TLS private key")
+	clientCAPath := flag.String("client-ca", "/home/yves/secure-messenger/certs/client_ca.pem", "Path to the client CA bundle")
 	listenAddr := flag.String("listen", ":8443", "Address the server should listen on")
 	storePath := flag.String("store", "data/messages.db", "Path to the message store file")
 	identityPath := flag.String("identity-store", "data/identity.db", "Path to the identity store file")
 	httpListenAddr := flag.String("http-listen", ":8080", "Address the HTTP API should listen on")
 	messageKey := flag.String("message-key", envOrDefault("SM_MESSAGE_KEY", messaging.DefaultMessageKeyBase64), "Base64-encoded AES-256 key for encrypting HTTP messages")
+	logDir := flag.String("log-dir", "data/logs", "Directory where server logs should be stored")
 	flag.Parse()
 
 	return serverConfig{
@@ -105,6 +110,7 @@ func parseConfig() serverConfig {
 		identityPath:   *identityPath,
 		httpListenAddr: *httpListenAddr,
 		messageKey:     *messageKey,
+		logDir:         *logDir,
 	}
 }
 
@@ -130,82 +136,7 @@ func mustMessageCipher(messageKey string) *messaging.AESGCMCipher {
 func prepareSeedData(identityPath, messagePath string, cipher *messaging.AESGCMCipher) {
 	if err := identity.EnsureSeedData(identityPath); err != nil {
 		log.Fatalf("seed identity store: %v", err)
-	}
-	if err := messaging.EnsureSeedData(messagePath, cipher); err != nil {
-		log.Fatalf("seed message store: %v", err)
-	}
-}
-
-func mustIdentityManager(identityPath string) *identity.Manager {
-	identityManager, err := identity.NewManager(identityPath)
-	if err != nil {
-		log.Fatalf("init identity store: %v", err)
-	}
-	return identityManager
-}
-
-func closeIdentityManager(manager *identity.Manager) {
-	if err := manager.Close(); err != nil {
-		log.Printf("close identity store: %v", err)
-	}
-}
-
-func mustLoadTLSConfig(cfg serverConfig, identityManager *identity.Manager) *tls.Config {
-	tlsCfg, err := mtls.LoadServerTLSConfig(cfg.certPath, cfg.keyPath, cfg.clientCAPath, func(cert *x509.Certificate) error {
-		_, err := identityManager.ValidateCertificate(cert)
-		return err
-	})
-	if err != nil {
-		log.Fatalf("TLS load: %v", err)
-	}
-	return tlsCfg
-}
-
-func listenOrExit(listenAddr string) net.Listener {
-	lis, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("listen: %v", err)
-	}
-	return lis
-}
-
-func mustMessageStore(messagePath string, cipher messaging.EnvelopeCipher) messageStore {
-	msgStore, err := messaging.NewStore(messagePath, cipher)
-	if err != nil {
-		log.Fatalf("init message store: %v", err)
-	}
-	return msgStore
-}
-
-func closeMessageStore(msgStore messageStore) {
-	if err := msgStore.Close(); err != nil {
-		log.Printf("close message store: %v", err)
-	}
-}
-
-func mustMessagingService(msgStore messageStore) *messaging.Service {
-	messagingService, err := messaging.NewService(msgStore)
-	if err != nil {
-		log.Fatalf("init messaging service: %v", err)
-	}
-	return messagingService
-}
-
-func mustAuthService(identityManager *identity.Manager) *auth.Service {
-	authService, err := auth.NewService(identityManager)
-	if err != nil {
-		log.Fatalf("init auth service: %v", err)
-	}
-	return authService
-}
-
-func mustDirectoryService(identityManager *identity.Manager) *directory.Service {
-	directoryService, err := directory.NewService(identityManager)
-	if err != nil {
-		log.Fatalf("init directory service: %v", err)
-	}
-	return directoryService
-}
+@@ -209,25 +215,42 @@ func mustDirectoryService(identityManager *identity.Manager) *directory.Service
 
 func mustHTTPMux(messagingService *messaging.Service, identityManager *identity.Manager, tokenManager *auth.TokenManager, cipher *messaging.AESGCMCipher) *http.ServeMux {
 	httpMessagesHandler, err := messaging.NewHTTPHandler(messagingService, tokenManager, cipher)
@@ -230,4 +161,21 @@ func startHTTPServer(listenAddr string, mux *http.ServeMux) {
 			log.Fatalf("http serve: %v", err)
 		}
 	}()
+}
+
+func setupLogging(logDir string) *os.File {
+	logFile, err := logging.Setup(logDir)
+	if err != nil {
+		log.Fatalf("init logging: %v", err)
+	}
+	return logFile
+}
+
+func closeLogFile(logFile *os.File) {
+	if logFile == nil {
+		return
+	}
+	if err := logFile.Close(); err != nil {
+		log.Printf("close log file: %v", err)
+	}
 }
